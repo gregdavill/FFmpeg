@@ -34,22 +34,20 @@ struct h264enc_internal {
 	unsigned int mb_width, mb_height, mb_stride;
 	unsigned int crop_right, crop_bottom;
 
-	struct ve_mem *luma_buffer;
-	struct ve_mem *chroma_buffer;
+	uint8_t *luma_buffer, *chroma_buffer;
 	unsigned int input_buffer_size;
 	enum color_format input_color_format;
 
-	struct ve_mem *bytestream_buffer;
+	uint8_t *bytestream_buffer;
 	unsigned int bytestream_buffer_size;
 	unsigned int bytestream_length;
 
 	struct h264enc_ref_pic {
-		struct ve_mem *luma_buffer;
-		struct ve_mem *chroma_buffer;
-		struct ve_mem *extra_buffer; /* unknown purpose, looks like smaller luma */
+		void *luma_buffer, *chroma_buffer;
+		void *extra_buffer; /* unknown purpose, looks like smaller luma */
 	} ref_picture[2];
 
-	struct ve_mem *extra_buffer_line, *extra_buffer_frame; /* unknown purpose */
+	void *extra_buffer_line, *extra_buffer_frame; /* unknown purpose */
 
 	void *regs;
 
@@ -233,8 +231,6 @@ h264enc *h264enc_new(const struct h264enc_params *p)
 {
 	h264enc *c;
 	int i;
-	void *a;
-	struct ve_mem *m;
 
 	/* check parameter validity */
 	if (!IS_ALIGNED(p->src_width, 16) || !IS_ALIGNED(p->src_height, 16) ||
@@ -299,14 +295,7 @@ h264enc *h264enc_new(const struct h264enc_params *p)
 	if (c->luma_buffer == NULL)
 		goto nomem;
 
-	a = c->luma_buffer->virt + p->src_width * p->src_height;
-	m = malloc(sizeof(struct ve_mem));
-	if (m == NULL)
-		goto nomem;
-	
-	m->virt = a;
-	m->phys = ve_virt2phys(a);
-	c->chroma_buffer = m;//c->luma_buffer->virt + p->src_width * p->src_height;
+	c->chroma_buffer = c->luma_buffer + p->src_width * p->src_height;
 
 	/* allocate bytestream output buffer */
 	c->bytestream_buffer_size = 1 * 1024 * 1024;
@@ -320,14 +309,7 @@ h264enc *h264enc_new(const struct h264enc_params *p)
 	for (i = 0; i < 2; i++)
 	{
 		c->ref_picture[i].luma_buffer = ve_malloc(luma_size + chroma_size);
-		a = c->ref_picture[i].luma_buffer->virt + luma_size;
-		m = malloc(sizeof(struct ve_mem));
-		if (m == NULL)
-			goto nomem;
-		m->virt = a;
-		m->phys = ve_virt2phys(a);
-		c->ref_picture[i].chroma_buffer = m;//c->ref_picture[i].luma_buffer->virt + luma_size;
-		
+		c->ref_picture[i].chroma_buffer = c->ref_picture[i].luma_buffer + luma_size;
 		c->ref_picture[i].extra_buffer = ve_malloc(luma_size / 4);
 		if (c->ref_picture[i].luma_buffer == NULL || c->ref_picture[i].extra_buffer == NULL)
 			goto nomem;
@@ -349,12 +331,12 @@ nomem:
 
 void *h264enc_get_input_buffer(const h264enc *c)
 {
-	return c->luma_buffer->virt;
+	return c->luma_buffer;
 }
 
 void *h264enc_get_bytestream_buffer(const h264enc *c)
 {
-	return c->bytestream_buffer->virt;
+	return c->bytestream_buffer;
 }
 
 unsigned int h264enc_get_bytestream_length(const h264enc *c)
@@ -369,13 +351,13 @@ int h264enc_encode_picture(h264enc *c)
 	c->regs = ve_get(VE_ENGINE_AVC, 0);
 
 	/* flush buffers (output because otherwise we might read old data later) */
-	ve_flush_cache(c->bytestream_buffer);
-	ve_flush_cache(c->luma_buffer);
+	ve_flush_cache(c->bytestream_buffer, c->bytestream_buffer_size);
+	ve_flush_cache(c->luma_buffer, c->input_buffer_size);
 
 	/* set output buffer */
 	writel(0x0, c->regs + VE_AVC_VLE_OFFSET);
-	writel(c->bytestream_buffer->phys, c->regs + VE_AVC_VLE_ADDR);
-	writel(c->bytestream_buffer->phys + c->bytestream_buffer_size - 1, c->regs + VE_AVC_VLE_END);
+	writel(ve_virt2phys(c->bytestream_buffer), c->regs + VE_AVC_VLE_ADDR);
+	writel(ve_virt2phys(c->bytestream_buffer) + c->bytestream_buffer_size - 1, c->regs + VE_AVC_VLE_END);
 	writel(c->bytestream_buffer_size * 8, c->regs + VE_AVC_VLE_MAX);
 
 	/* write headers */
@@ -395,28 +377,28 @@ int h264enc_encode_picture(h264enc *c)
 	writel(c->input_color_format << 29, c->regs + VE_ISP_CTRL);
 
 	/* set input buffer */
-	writel(c->luma_buffer->phys, c->regs + VE_ISP_INPUT_LUMA);
-	writel(c->chroma_buffer->phys, c->regs + VE_ISP_INPUT_CHROMA);
-	
+	writel(ve_virt2phys(c->luma_buffer), c->regs + VE_ISP_INPUT_LUMA);
+	writel(ve_virt2phys(c->chroma_buffer), c->regs + VE_ISP_INPUT_CHROMA);
+
 	/* set reconstruction buffers */
 	struct h264enc_ref_pic *ref_pic = &c->ref_picture[c->current_frame_num % 2];
-	writel(ref_pic->luma_buffer->phys, c->regs + VE_AVC_REC_LUMA);
-	writel(ref_pic->chroma_buffer->phys, c->regs + VE_AVC_REC_CHROMA);
-	writel(ref_pic->extra_buffer->phys, c->regs + VE_AVC_REC_SLUMA);
+	writel(ve_virt2phys(ref_pic->luma_buffer), c->regs + VE_AVC_REC_LUMA);
+	writel(ve_virt2phys(ref_pic->chroma_buffer), c->regs + VE_AVC_REC_CHROMA);
+	writel(ve_virt2phys(ref_pic->extra_buffer), c->regs + VE_AVC_REC_SLUMA);
 
 	/* set reference buffers */
 	if (c->current_slice_type != SLICE_I)
 	{
 		ref_pic = &c->ref_picture[(c->current_frame_num + 1) % 2];
-		writel(ref_pic->luma_buffer->phys, c->regs + VE_AVC_REF_LUMA);
-		writel(ref_pic->chroma_buffer->phys, c->regs + VE_AVC_REF_CHROMA);
-		writel(ref_pic->extra_buffer->phys, c->regs + VE_AVC_REF_SLUMA);
+		writel(ve_virt2phys(ref_pic->luma_buffer), c->regs + VE_AVC_REF_LUMA);
+		writel(ve_virt2phys(ref_pic->chroma_buffer), c->regs + VE_AVC_REF_CHROMA);
+		writel(ve_virt2phys(ref_pic->extra_buffer), c->regs + VE_AVC_REF_SLUMA);
 	}
 
 	/* set unknown purpose buffers */
-	writel(c->extra_buffer_line->phys, c->regs + VE_AVC_MB_INFO);
-	writel(c->extra_buffer_frame->phys, c->regs + VE_AVC_UNK_BUF);
-	
+	writel(ve_virt2phys(c->extra_buffer_line), c->regs + VE_AVC_MB_INFO);
+	writel(ve_virt2phys(c->extra_buffer_frame), c->regs + VE_AVC_UNK_BUF);
+
 	/* enable interrupt and clear status flags */
 	writel(readl(c->regs + VE_AVC_CTRL) | 0xf, c->regs + VE_AVC_CTRL);
 	writel(readl(c->regs + VE_AVC_STATUS) | 0x7, c->regs + VE_AVC_STATUS);
@@ -451,4 +433,3 @@ int h264enc_encode_picture(h264enc *c)
 
 	return (status & 0x3) == 0x1;
 }
-
